@@ -1,0 +1,37 @@
+{
+  "8-bit NES": {
+    "lora_path": "models/lora/8bit-nes",
+    "prompt": "8-bit NES pixel art, pixelated, limited palette",
+    "negative_prompt": "photorealistic, high detail, smooth gradients",
+    "lora_scale": 0.9,
+    "control_tile_size": 64
+  },
+  "16-bit SNES": {
+    "lora_path": "models/lora/16bit-snes",
+    "prompt": "16-bit SNES pixel art, colorful, retro game style",
+    "negative_prompt": "photorealistic, high detail, smooth gradients",
+    "lora_scale": 0.9,
+    "control_tile_size": 64
+  },
+  "1-bit": {
+    "lora_path": "models/lora/1bit",
+    "prompt": "1-bit pixel art, black and white, dithering",
+    "negative_prompt": "color, photorealistic, high detail",
+    "lora_scale": 0.85,
+    "control_tile_size": 64
+  },
+  "Game Boy": {
+    "lora_path": "models/lora/gameboy",
+    "prompt": "Game Boy pixel art, green monochrome palette",
+    "negative_prompt": "photorealistic, high detail, smooth gradients",
+    "lora_scale": 0.9,
+    "control_tile_size": 64
+  },
+  "Cyberpunk Pixel": {
+    "lora_path": "models/lora/cyberpunk-pixel",
+    "prompt": "cyberpunk pixel art, neon lights, futuristic city",
+    "negative_prompt": "photorealistic, blurry, smooth gradients",
+    "lora_scale": 0.9,
+    "control_tile_size": 64
+  }
+}
