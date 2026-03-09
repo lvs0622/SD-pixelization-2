@@ -1,0 +1,546 @@
+import os
+import inspect
+import logging
+import math
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import lightning as L
+import imageio.v3 as imageio
+from tqdm.auto import tqdm
+from einops import rearrange
+from torchvision.utils import make_grid
+from typing import Optional, Literal
+from omegaconf import OmegaConf
+
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
+
+import wandb
+import diffusers
+import transformers
+from diffusers import (
+    ModelMixin,
+    AutoencoderKL,
+    ControlNetModel,
+    DDIMScheduler,
+    UNet2DConditionModel,
+    DiffusionPipeline,
+    StableDiffusionPipeline
+)
+from diffusers.models.attention_processor import (
+    LoRAAttnProcessor, 
+    LoRAXFormersAttnProcessor,
+    XFormersAttnProcessor, 
+    AttnProcessor
+)
+
+from diffusers.utils import is_xformers_available
+from diffusers.loaders import AttnProcsLayers
+from diffusers.optimization import get_scheduler
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from accelerate.logging import get_logger
+
+from dataset import LoRADataset
+
+
+logger = get_logger(__name__, log_level="INFO")
+
+# modify here
+data_root = "./data/1bit"
+
+# ========== 1bit像素风格辅助损失函数 ==========
+def color_quantization_loss(image):
+    """
+    颜色量化损失：强制图像只有纯黑和纯白，消除灰度
+    image: 输入图像张量，形状为 [B, C, H, W]，值范围 [-1, 1] 或 [0, 1]
+    """
+    # 将图像值归一化到 [0, 255]
+    if image.min() < 0:  # 如果是 [-1,1] 范围，转换为 [0,255]
+        image = (image + 1) * 127.5
+    
+    # 二值化目标：大于127的为255，小于等于127的为0
+    target = torch.where(
+        image > 127, 
+        torch.tensor(255.0, device=image.device, dtype=image.dtype), 
+        torch.tensor(0.0, device=image.device, dtype=image.dtype)
+    )
+    
+    # 计算MSE损失，惩罚灰度像素
+    loss = F.mse_loss(image, target)
+    return loss
+
+def pixel_block_structure_loss(image, block_size=8):
+    """
+    像素块结构损失：强制图像呈现块化的像素结构
+    image: 输入图像张量，形状为 [B, C, H, W]，值范围 [-1, 1] 或 [0, 1]
+    block_size: 像素块大小（如8x8）
+    """
+    # 归一化到 [0, 1]
+    if image.min() < 0:
+        image = (image + 1) / 2.0
+    
+    B, C, H, W = image.shape
+    
+    # 确保尺寸能被block_size整除
+    new_h = (H // block_size) * block_size
+    new_w = (W // block_size) * block_size
+    if new_h != H or new_w != W:
+        image = F.interpolate(image, size=(new_h, new_w), mode='nearest')
+    
+    # 步骤1：用最近邻插值降采样（模拟像素块）
+    downsampled = F.interpolate(
+        image, 
+        size=(new_h//block_size, new_w//block_size), 
+        mode='nearest'
+    )
+    
+    # 步骤2：上采样回原尺寸（恢复块化效果）
+    pixelated = F.interpolate(
+        downsampled, 
+        size=(new_h, new_w), 
+        mode='nearest'
+    )
+    
+    # 步骤3：计算原图像与块化图像的MSE损失，惩罚非块化的细节
+    loss = F.mse_loss(image, pixelated)
+    return loss
+
+def init_lora_attn(model, lora_rank=4):
+    lora_attn_procs = {}
+    for name in model.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else model.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = model.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(model.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = model.config.block_out_channels[block_id]
+        procs = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=lora_rank)
+        lora_attn_procs[name] = procs
+    return lora_attn_procs
+
+
+def main(
+    *,
+    exp_name: str,
+    mode: Literal['lora', 'textual_inversion'] = 'lora',
+    num_images_to_train: int = 103,
+    pretrained_model_path: str = "models/sd15",
+    lora_rank: int = 8,
+    output_dir: str = "./output",
+    seed: Optional[int] = 42,
+    learning_rate: float = 3e-4,
+    train_batch_size: int = 2,
+    max_train_steps: int = 800,  # 核心：降低步数避免过拟合
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_weight_decay: float = 5e-4,  # 核心：提高权重衰减抑制过拟合
+    adam_epsilon: float = 1e-08,
+    max_grad_norm: float = 1.0,
+    lr_scheduler: str = "cosine",
+    lr_warmup_steps: int = 100,
+    mixed_precision: Optional[str] = "fp16",
+    scale_lr: bool = True,
+    gradient_accumulation_steps: int = 4,
+    gradient_checkpointing: bool = True,
+    checkpointing_step_interv: int = 200,
+    validation_step_interv: int = 100,  # 核心：每100步验证，更早找到干净检查点
+    resume_from_checkpoint: Optional[str] = None,
+    enable_xformers_memory_efficient_attention: bool = False,
+    num_inference_steps: int = 20,
+    num_validation_images: int = 8,
+    # 核心：强化验证prompt，明确禁止额外元素/边框
+    validation_prompt: str = "1bit pixel art, black and white, pixelated, clean edges, solid black and white, no gray, no anti-aliasing, minimalistic, no extra elements, no borders, no frame",
+    guidance_scale: float = 8.5,
+    # 核心：扩充negative prompt，全面禁止边框/噪点/乱像素
+    negative_prompt: str = "grayscale, gray, color, gradient, blur, soft edges, photorealistic, 3d, shading, texture, noise, artifacts, extra lines, random pixels, extra borders, black borders, white borders, messy edges, text, watermark, shadow, shading, half-tone, dithering, frame, border, square, rectangle, corner, edge artifacts, isolated pixels, stray pixels, background noise",
+    # 新增：辅助损失相关参数
+    quant_loss_weight: float = 0.1,    # 颜色量化损失权重
+    block_loss_weight: float = 0.2,    # 像素块损失权重
+    block_size: int = 8,               # 像素块大小
+    aux_loss_freq: int = 5,            # 辅助损失计算频率（每N步计算一次）
+    # 新增data_root参数（关键！）
+    data_root: str = "./data/1bit"
+):
+    
+    *_, config = inspect.getargvalues(inspect.currentframe())
+    output_dir = os.path.join(output_dir, exp_name)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
+        log_with="tensorboard",
+        project_dir=os.path.join(output_dir, 'logs')
+    )
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    # If passed along, set the training seed now.
+    if seed is not None:
+        set_seed(seed)
+
+    # Handle the output folder creation
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(f"{output_dir}/validation", exist_ok=True)
+        os.makedirs(f"{output_dir}/pretrained", exist_ok=True)
+        OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
+
+    # Load scheduler, tokenizer and models.
+    noise_scheduler = DDIMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
+    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+
+    # Freeze vae, unet and text_encoder
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+
+    # mixed precision
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move unet, vae and text_encoder to device and cast to weight_dtype
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device, dtype=weight_dtype)
+
+    lora_attn_procs = init_lora_attn(unet, lora_rank)
+    unet.set_attn_processor(lora_attn_procs)
+
+    if enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+        
+    lora_layers = AttnProcsLayers(unet.attn_processors)
+    
+    if gradient_checkpointing:
+        unet.enable_gradient_checkpointing() 
+
+    if scale_lr:
+        learning_rate = (
+            learning_rate * gradient_accumulation_steps * train_batch_size * accelerator.num_processes
+        )
+
+    # Initialize the optimizer
+    optimizer = torch.optim.AdamW(
+        lora_layers.parameters(),
+        lr=learning_rate,
+        betas=(adam_beta1, adam_beta2),
+        weight_decay=adam_weight_decay,
+        eps=adam_epsilon
+    )
+
+    # Dataset creation
+    train_dataset = LoRADataset(
+        root=data_root,
+        split="train",
+        length=num_images_to_train,
+    )
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=train_batch_size, shuffle=True,
+    )
+    
+    # Scheduler
+    lr_scheduler = get_scheduler(
+        lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=lr_warmup_steps * gradient_accumulation_steps,
+        num_training_steps=max_train_steps * gradient_accumulation_steps,
+    )
+
+    # Prepare everything with our `accelerator`.
+    lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        lora_layers, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # Recalculate training steps
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
+    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+
+    # Initialize trackers
+    if accelerator.is_main_process:
+        accelerator.init_trackers(exp_name)
+
+    total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {train_batch_size}")
+    logger.info(f"  Total train batch size = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {max_train_steps}")
+    logger.info(f"  Aux loss weights - quant: {quant_loss_weight}, block: {block_loss_weight}")
+    logger.info(f"  Pixel block size: {block_size}, aux loss freq: {aux_loss_freq}")
+    
+    global_step = 0
+    first_epoch = 0
+
+    # Resume from checkpoint
+    if resume_from_checkpoint:
+        if resume_from_checkpoint != "latest":
+            path = os.path.basename(resume_from_checkpoint)
+        else:
+            dirs = os.listdir(output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if dirs else None
+        
+        if path is None:
+            accelerator.print(f"Checkpoint '{resume_from_checkpoint}' does not exist. Starting fresh.")
+            resume_from_checkpoint = None
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(output_dir, path))
+            global_step = int(path.split("-")[1])
+            first_epoch = global_step // num_update_steps_per_epoch
+            resume_step = global_step % num_update_steps_per_epoch
+
+    # Progress bar
+    progress_bar = tqdm(range(global_step, max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
+
+    @torch.no_grad()
+    def get_input(batch, encode_image=True, encode_prompt=True):
+        """
+        获取训练输入：图像latent和文本embedding
+        """
+        x = batch['image']
+        B = x.shape[0]
+        device = accelerator.device
+        
+        if x.shape[-1] == 3:
+            x = rearrange(x, 'b h w c -> b c h w')
+        x = x.to(device=device, memory_format=torch.contiguous_format)
+
+        if encode_image:
+            # Convert images to latent space
+            x = vae.encode(batch["image"].to(dtype=weight_dtype)).latent_dist.sample()
+            x = x * vae.config.scaling_factor
+
+        prompt = batch['prompt']
+        if isinstance(prompt, str):
+            prompt = [prompt] * B
+        elif isinstance(prompt, list):
+            assert len(prompt) == B, "Prompt list length must match batch size!"
+
+        if encode_prompt:
+            text_inputs = tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids
+            untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                text_input_ids, untruncated_ids
+            ):
+                removed_text = tokenizer.batch_decode(
+                    untruncated_ids[:, tokenizer.model_max_length - 1 : -1]
+                )
+                logger.warning(f"Prompt truncated: {removed_text}")
+
+            attention_mask = text_inputs.attention_mask.to(device) if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask else None
+
+            prompt = text_encoder(
+                text_input_ids.to(device),
+                attention_mask=attention_mask,
+            )[0]
+            prompt = prompt.to(dtype=text_encoder.dtype, device=device)
+
+        return x, prompt
+
+    # Training loop
+    for epoch in range(first_epoch, num_train_epochs):
+        unet.train()
+        train_loss = 0.0
+        for step, batch in enumerate(train_dataloader):
+            # Skip resumed steps
+            if resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
+
+            with accelerator.accumulate(unet):
+                # Get input
+                x, prompt_embed = get_input(batch)
+                t = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                    (x.shape[0],), device=accelerator.device
+                ).long()
+                # Add noise
+                noise = torch.randn_like(x)
+                x_noisy = noise_scheduler.add_noise(x, noise, t)
+
+                # Get target for noise prediction
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(x, noise, t)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                # Predict noise and compute base loss
+                model_pred = unet(x_noisy, t, prompt_embed).sample
+                base_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # ========== 新增：辅助损失计算 ==========
+                aux_loss = 0.0
+                quant_loss_val = 0.0
+                block_loss_val = 0.0
+                
+                # 每隔N步计算一次辅助损失，节省计算资源
+                if global_step % aux_loss_freq == 0 and accelerator.is_main_process:
+                    with torch.no_grad():
+                        # 将latent解码为像素空间图像
+                        x_decoded = x / vae.config.scaling_factor
+                        x_image = vae.decode(x_decoded.to(dtype=weight_dtype)).sample  # [-1, 1]
+                    
+                    # 计算颜色量化损失
+                    quant_loss_val = color_quantization_loss(x_image)
+                    
+                    # 计算像素块结构损失
+                    block_loss_val = pixel_block_structure_loss(x_image, block_size=block_size)
+                    
+                    # 加权融合辅助损失
+                    aux_loss = quant_loss_weight * quant_loss_val + block_loss_weight * block_loss_val
+
+                # 总损失 = 基础噪声损失 + 辅助损失
+                total_loss = base_loss + aux_loss
+
+                # Gather losses for logging
+                avg_loss = accelerator.gather(total_loss.repeat(train_batch_size)).mean()
+                train_loss += avg_loss.item() / gradient_accumulation_steps
+
+                # Backpropagation
+                accelerator.backward(total_loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(lora_layers.parameters(), max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Update progress and logging
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                
+                # 记录所有损失值
+                log_dict = {
+                    "train_loss": train_loss,
+                    "base_loss": base_loss.detach().item(),
+                    "aux_loss": aux_loss.detach().item() if aux_loss > 0 else 0.0,
+                    "quant_loss": quant_loss_val.detach().item() if quant_loss_val > 0 else 0.0,
+                    "block_loss": block_loss_val.detach().item() if block_loss_val > 0 else 0.0,
+                    "lr": lr_scheduler.get_last_lr()[0]
+                }
+                accelerator.log(log_dict, step=global_step)
+                train_loss = 0.0
+
+                # Save checkpoint
+                if global_step % checkpointing_step_interv == 0 and accelerator.is_main_process:
+                    save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved checkpoint to {save_path}")
+
+            # Update progress bar
+            logs = {
+                "step_loss": total_loss.detach().item(),
+                "base_loss": base_loss.detach().item(),
+                "aux_loss": aux_loss.detach().item() if aux_loss > 0 else 0.0,
+                "lr": lr_scheduler.get_last_lr()[0]
+            }
+            progress_bar.set_postfix(**logs)
+
+            # Stop training if max steps reached
+            if global_step >= max_train_steps:
+                break
+
+        # Validation
+        if accelerator.is_main_process and validation_prompt is not None and global_step % validation_step_interv == 0:
+            logger.info(f"Running validation with prompt: {validation_prompt}")
+            # Create inference pipeline
+            pipeline = StableDiffusionPipeline.from_pretrained(
+                pretrained_model_path,
+                unet=accelerator.unwrap_model(unet),
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                scheduler=noise_scheduler,
+                torch_dtype=weight_dtype,
+                safety_checker=None,
+                requires_safety_checker=False
+            )
+            pipeline = pipeline.to(accelerator.device)
+            pipeline.set_progress_bar_config(disable=True)
+
+            # Generate validation images
+            generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+            images = []
+            for _ in range(num_validation_images):
+                images.append(
+                    pipeline(
+                        validation_prompt,
+                        num_inference_steps=num_inference_steps,
+                        generator=generator,
+                        guidance_scale=guidance_scale,
+                        negative_prompt=negative_prompt,
+                    ).images[0]
+                )
+
+            # Log validation images
+            for tracker in accelerator.trackers:
+                if tracker.name == "tensorboard":
+                    np_images = np.stack([np.asarray(img) for img in images])
+                    tracker.writer.add_images("validation", np_images, global_step, dataformats="NHWC")
+                if tracker.name == "wandb":
+                    tracker.log({
+                        "validation": [wandb.Image(img, caption=f"{i}: {validation_prompt}") for i, img in enumerate(images)]
+                    })
+
+            del pipeline
+            torch.cuda.empty_cache()
+
+    # Save final LoRA weights
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unet = unet.to(torch.float32)
+        unet.save_attn_procs(output_dir)
+        logger.info(f"Final LoRA weights saved to {output_dir}")
+            
+    accelerator.end_training()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="./configs/lora_1bit.yaml")
+    args = parser.parse_args()
+
+    # Load config and run training
+    config = OmegaConf.load(args.config)
+    main(**config)
+
