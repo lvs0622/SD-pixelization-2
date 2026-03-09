@@ -1,0 +1,214 @@
+import torch
+from diffusers import (
+    StableDiffusionControlNetPipeline,
+    ControlNetModel,
+    EulerDiscreteScheduler,
+    AutoencoderKL
+)
+from diffusers.utils import load_image
+import cv2
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import random
+
+# ====================== 稳健研究配置（针对性优化像素感+减少杂色） ======================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+sd_path = "/root/autodl-tmp/SD-pixelization-2/models/sd15"
+lora_path = "/root/autodl-tmp/SD-pixelization-2/output/1bit/pytorch_lora_weights.safetensors"
+controlnet_path = "./models/control_v11p_sd15_canny"
+input_image_path = "./input.png"
+output_dir = "./research_results/"
+
+# 【核心优化1】平衡风格与结构，强化像素感
+CONTROLNET_SCALE = 0.9    # 提高ControlNet强度，强制约束线条结构，减少乱生成
+LORA_SCALE = 0.9          # 提高LoRA强度，强化像素风格特征
+GUIDANCE_SCALE = 9.0      # 提高CFG，让prompt更精准控制风格
+INFERENCE_STEPS = 25      # 减少步数，避免过度生成杂色（像素风格无需多步数）
+SEED = 42  # 固定种子，便于复现和调优（随机种子易出坏结果）
+
+# ====================== 工具函数（强化像素感+减少杂色） ======================
+def create_output_dir(dir_path):
+    import os
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+    return dir_path
+
+def get_stable_canny(image, low=80, high=160):
+    """
+    优化：提高Canny阈值+强化边缘，减少噪声，适配像素风格硬边缘
+    """
+    img_gray = np.array(image.convert("L"))
+    img_blur = cv2.GaussianBlur(img_gray, (3, 3), 0)  # 更小模糊核，保留线条细节
+    edges = cv2.Canny(img_blur, low, high)
+    # 二值化处理：强制边缘只有纯黑/纯白，强化像素硬边
+    edges[edges > 0] = 255
+    edges = np.expand_dims(edges, axis=2)
+    edges = np.repeat(edges, 3, axis=2)
+    return Image.fromarray(edges)
+
+def post_process_1bit(image, threshold=127, pixel_size=8):
+    """
+    先降分辨率，再放大，实现块化像素感
+    """
+    img_gray = np.array(image.convert("L"))
+    # 1. 二值化
+    img_1bit = np.where(img_gray > threshold, 255, 0).astype(np.uint8)
+    # 2. 降分辨率（关键：强制块化）
+    h, w = img_1bit.shape
+    small_h, small_w = h // pixel_size, w // pixel_size
+    img_small = cv2.resize(img_1bit, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+    # 3. 放大回原尺寸，用最近邻插值保持块化
+    img_pixelated = cv2.resize(img_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    # 转为RGB
+    img_pixelated = np.expand_dims(img_pixelated, axis=2)
+    img_pixelated = np.repeat(img_pixelated, 3, axis=2)
+    return Image.fromarray(img_pixelated)
+def plot_research_results(original, canny, final_result, post_result, save_path):
+    """优化：增加后处理对比图，直观看到像素化效果"""
+    plt.figure(figsize=(20, 5))
+    plt.subplot(1, 4, 1)
+    plt.imshow(original)
+    plt.title("Original Input")
+    plt.axis("off")
+    
+    plt.subplot(1, 4, 2)
+    plt.imshow(canny, cmap="gray")
+    plt.title("Sharp Canny Condition")
+    plt.axis("off")
+    
+    plt.subplot(1, 4, 3)
+    plt.imshow(final_result, cmap="gray")
+    plt.title("Diffusion Result")
+    plt.axis("off")
+    
+    plt.subplot(1, 4, 4)
+    plt.imshow(post_result, cmap="gray")
+    plt.title("1bit Pixel Result (Post)")
+    plt.axis("off")
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+# ====================== 模型加载（兼容LoRA融合） ======================
+create_output_dir(output_dir)
+
+# 1. 加载ControlNet
+controlnet = ControlNetModel.from_pretrained(
+    controlnet_path,
+    torch_dtype=torch.float16
+).to(device)
+
+# 2. 加载VAE
+try:
+    vae = AutoencoderKL.from_pretrained(
+        sd_path,
+        subfolder="vae",
+        torch_dtype=torch.float16
+    ).to(device)
+except Exception as e:
+    print(f"VAE加载失败，使用管道默认VAE: {e}")
+    vae = None
+
+# 3. 加载管道
+pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    sd_path,
+    controlnet=controlnet,
+    vae=vae,
+    torch_dtype=torch.float16,
+    safety_checker=None,
+    requires_safety_checker=False
+).to(device)
+
+# 用 DPM++ 2M Karras 或 Euler a，步数控制在 20-30
+pipe.scheduler = EulerDiscreteScheduler.from_config(
+    pipe.scheduler.config,
+    use_karras_sigmas=True
+)
+INFERENCE_STEPS = 25  # 保持你现在的设置
+# 5. 加载LoRA（优化融合方式）
+pipe.load_lora_weights(lora_path)
+pipe.fuse_lora(lora_scale=LORA_SCALE)
+
+# ====================== 图像预处理 ======================
+original_image = load_image(input_image_path).resize((512, 512))
+canny_image = get_stable_canny(original_image)  # 强化版Canny
+
+# ====================== 优化版提示词（强化像素特征） ======================
+prompt = (
+    "1bit pixel art, black and white, pixelated, "
+    "hard edges, blocky pixels, no anti-aliasing, no gradient, "
+    "clean pixel art, minimalistic, solid black and white only, "
+    "preserve original shape and composition, no extra elements"  # 禁止额外生成
+)
+
+negative_prompt = (
+    "grayscale, gray, color, gradient, blur, soft edges, "
+    "photorealistic, 3d, shading, texture, noise, artifacts, "
+    "extra lines, random pixels, extra borders, messy edges, "  # 明确禁止杂色/乱线条
+    "text, watermark, shadow, shading, half-tone, dithering"
+)
+
+# ====================== 核心推理（增加稳定性） ======================
+generator = torch.manual_seed(SEED)
+print(f"🔢 使用固定种子：{SEED}（便于调优）")
+
+# 推理（启用autocast，提升精度）
+with torch.autocast("cuda"):
+    native_1bit_result = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        image=canny_image,
+        num_inference_steps=INFERENCE_STEPS,
+        guidance_scale=GUIDANCE_SCALE,
+        controlnet_conditioning_scale=CONTROLNET_SCALE,
+        generator=generator,
+        width=512,
+        height=512,
+        cross_attention_kwargs={"scale": LORA_SCALE}
+    ).images[0]
+
+# ====================== 后处理+保存 ======================
+# 新增：1bit后处理，强制纯黑白像素风格
+def palette_quantize(image):
+    img = np.array(image.convert("L"))
+
+    palette = np.array([0,255])
+
+    idx = np.abs(img[:,:,None] - palette).argmin(axis=2)
+    quant = palette[idx]
+
+    quant = np.stack([quant]*3,axis=-1)
+
+    return Image.fromarray(quant.astype(np.uint8))
+
+# 保存所有结果
+original_image.save(f"{output_dir}/original.png")
+canny_image.save(f"{output_dir}/canny_condition.png")
+native_1bit_result.save(f"{output_dir}/diffusion_native_1bit.png")
+post_processed_result.save(f"{output_dir}/1bit_pixel_final.png")
+
+# 生成对比图（包含后处理）
+plot_research_results(
+    original_image, 
+    canny_image, 
+    native_1bit_result, 
+    post_processed_result,
+    f"{output_dir}/research_comparison.png"
+)
+
+# 1bit纯度计算（优化：基于后处理结果）
+def calculate_1bit_purity(image):
+    img_np = np.array(image.convert("L"))
+    total = img_np.size
+    pure_pixels = np.sum((img_np == 0) | (img_np == 255))
+    purity = (pure_pixels / total) * 100
+    return purity
+
+raw_purity = calculate_1bit_purity(native_1bit_result)
+final_purity = calculate_1bit_purity(post_processed_result)
+
+print(f"✅ 1bit像素生成完成！")
+print(f"📊 扩散结果1bit纯度：{raw_purity:.2f}%")
+print(f"📊 后处理1bit纯度：{final_purity:.2f}%（接近100%为理想）")
